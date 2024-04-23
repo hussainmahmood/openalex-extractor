@@ -1,9 +1,10 @@
 import os, time, pathlib
 import requests as rq
-from requests.exceptions import RequestException, ConnectionError
+from requests.exceptions import RequestException
 import polars as pl
 from dotenv import load_dotenv
 import tenacity
+
 
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(RequestException),
@@ -12,16 +13,53 @@ import tenacity
     reraise=True
 )
 def request(issn, from_date, to_date, page=1, per_page=200, mail_to="you@example.com"):
-    results = []
+    main_results = []
     referenced_works = []
-    cited_by_links = []
+    citing_works = []
+    results = []
+
     while True:
         r = rq.get(f"https://api.openalex.org/works?page={page}&per-page={per_page}&filter=primary_location.source.issn:{issn},from_publication_date:{from_date},to_publication_date:{to_date}&sort=publication_year&mailto={mail_to}")
         r.raise_for_status()
-        results.extend(r.json()["results"])
+        main_results.extend(r.json()["results"])
         if page*per_page >= r.json()["meta"]["count"]:
             break
         page += 1
+    
+    results.extend(main_results)
+    for work in main_results:
+        work_id = work["id"].split("/")[-1]
+
+        # referenced works
+        page = 1
+        while True:
+            r = rq.get(f"https://api.openalex.org/works?page={page}&per-page={per_page}&filter=cited_by:{work_id},primary_location.source.type:journal&mailto={mail_to}")
+            r.raise_for_status()
+            referenced_works.extend([{"reference_id": work["id"].split("/")[-1], "referenced_by": work_id} for work in r.json()["results"]])
+            results.extend(r.json()["results"])
+            if page*per_page >= r.json()["meta"]["count"]:
+                break
+            page += 1
+            
+        # citing workd
+        page = 1
+        while True:
+            r = rq.get(f"https://api.openalex.org/works?page={page}&per-page={per_page}&filter=cites:{work_id},primary_location.source.type:journal&mailto={mail_to}")
+            r.raise_for_status()
+            citing_works.extend([{"reference_id": work_id, "referenced_by": work["id"].split("/")[-1]} for work in r.json()["results"]])
+            results.extend(r.json()["results"])
+            if page*per_page >= r.json()["meta"]["count"]:
+                break
+            page += 1
+
+
+    referenced_works_df = pl.DataFrame(referenced_works)
+    referenced_works_df = referenced_works_df.unique().sort("referenced_by")
+    referenced_works_df.write_csv("data/referenced_works.csv")
+
+    citing_works_df = pl.DataFrame(citing_works)
+    citing_works_df = citing_works_df.unique().sort("reference_id")
+    citing_works_df.write_csv("data/citing_works.csv")
 
     works = [
                 {
@@ -33,7 +71,10 @@ def request(issn, from_date, to_date, page=1, per_page=200, mail_to="you@example
                     "publication_year": work["publication_year"], 
                     "volume": work["biblio"]["volume"], 
                     "issue": work["biblio"]["issue"], 
-                    "type": work["type"], 
+                    "type": work["type"],
+                    "source": work["primary_location"]["source"]["display_name"] if work["primary_location"].get("source", None) else None,
+                    "source_orginization": work["primary_location"]["source"]["host_organization_name"] if work["primary_location"].get("source", None) else None,
+                    "source_type": work["primary_location"]["source"]["type"] if work["primary_location"].get("source", None) else None,
                     "citation_count": work["cited_by_count"], 
                     "reference_count": work["referenced_works_count"]
                 } 
@@ -41,7 +82,7 @@ def request(issn, from_date, to_date, page=1, per_page=200, mail_to="you@example
             ]
     
     works_df = pl.DataFrame(works)
-    works_df = works_df.unique().sort(["publication_year", "volume", "issue"])
+    works_df = works_df.unique().sort(["source_type", "source_orginization", "source", "publication_year", "volume", "issue"])
     works_df.write_csv("data/works.csv")
     
     authors =   [
@@ -103,6 +144,7 @@ def request(issn, from_date, to_date, page=1, per_page=200, mail_to="you@example
     works_authors_institutions_df = works_authors_institutions_df.unique().sort(["work_id", "author_id", "institution_id"])
     works_authors_institutions_df.write_csv("data/works_authors_institutions.csv")
 
+
 def main():
     load_dotenv()
     env = os.environ
@@ -116,4 +158,4 @@ if __name__=="__main__":
     start_time = time.time()
     main()
     print(f"{'-'*10}Extraction complete{'-'*10}")
-    print(f"Elapsed time: {time.time()-start_time}")
+    print(f"Elapsed time: {time.time()-start_time} seconds")
