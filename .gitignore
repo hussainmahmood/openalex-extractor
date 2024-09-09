@@ -1,4 +1,5 @@
 .venv
 .env
-data/*.csv
-output/*.csv
+.idea
+data/*.*
+output/*.*
